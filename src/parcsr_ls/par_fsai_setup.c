@@ -70,12 +70,18 @@ hypre_ExtractDenseRowFromCSRMatrix( hypre_CSRMatrix *A_diag,
    HYPRE_Int      *A_j              = hypre_CSRMatrixJ(A_diag);
    HYPRE_Real     *A_data           = hypre_CSRMatrixData(A_diag);
    HYPRE_Complex  *sub_row_data     = hypre_VectorData(A_subrow);
-   HYPRE_Int i, cc;
+   HYPRE_Int n, cc;
 
-   for(i = A_i[row_num]; i < A_i[row_num+1]; i++)
-      if((cc = marker[A_j[i]]) >= 0)
-         sub_row_data[cc] = A_data[i];
+   for(n = A_i[row_num]; n < A_i[row_num+1]; n++)
+   {
+      if(A_j[n] > row_num)
+         break;
+      if(A_j[n] == row_num)
+         continue;
 
+      if((cc = marker[A_j[n]]) >= 0)
+         sub_row_data[cc] = A_data[n];
+   }
    return hypre_error_flag;
 
 }
@@ -314,9 +320,7 @@ hypre_FSAISetup( void               *fsai_vdata,
    hypre_ParFSAIDataRWork(fsai_data)         = r_work;
    hypre_ParFSAIDataZWork(fsai_data)         = z_work;
 
-   HYPRE_Int *nnz_per_row   = hypre_CTAlloc(HYPRE_Int, hypre_ParCSRMatrixGlobalNumRows(A), HYPRE_MEMORY_HOST);
-   //for(i = 0; i < hypre_ParCSRMatrixGlobalNumRows(A); i++)
-   //   nnz_per_row[i] = 1;
+   HYPRE_Int *nnz_per_row   = hypre_CTAlloc(HYPRE_Int, hypre_ParCSRMatrixGlobalNumRows(G), HYPRE_MEMORY_HOST); /* Used for Condensing the Matrix Down */
 
 #ifdef HYPRE_USING_OPENMP
 #pragma omp parallel private(i, j, k)
@@ -327,8 +331,8 @@ hypre_FSAISetup( void               *fsai_vdata,
       hypre_partition1D(num_rows, hypre_NumActiveThreads(), hypre_GetThreadNum(), &start_row, &end_row);
 
       hypre_Vector           *G_temp;            /* Holds a single row of G while it's being calculated */
-      hypre_Vector           *A_sub;             /* Holds the A[P, P] submatrix of A */
       hypre_Vector           *A_subrow;          /* Holds A[i, P] for the kaporin gradient */
+      hypre_Vector           *A_sub;             /* Holds the A[P, P] submatrix of A */
       hypre_Vector           *sol_vec;           /* Holds solution of hypre_dpotrs */
       hypre_Vector           *kaporin_gradient;  /* Holds the Kaporin Gradient for each iteration of aFSAI */
       HYPRE_Int              *kap_grad_nonzeros; /* Holds the kaporin_gradient nonzero indices */
@@ -345,8 +349,8 @@ hypre_FSAISetup( void               *fsai_vdata,
       A_sub             = hypre_SeqVectorCreate(max_row_size*max_row_size);
       S_Pattern         = hypre_CTAlloc(HYPRE_Int, max_row_size, HYPRE_MEMORY_HOST);
       kap_grad_nonzeros = hypre_CTAlloc(HYPRE_Int, max_row_size, HYPRE_MEMORY_HOST);
-      marker            = hypre_CTAlloc(HYPRE_Int, num_rows, HYPRE_MEMORY_HOST);       /* For gather functions - don't want to reinitialize */
-      kg_marker         = hypre_CTAlloc(HYPRE_Int, num_rows, HYPRE_MEMORY_HOST);       /* For kaporin gradient functions */
+      marker            = hypre_CTAlloc(HYPRE_Int, end_row, HYPRE_MEMORY_HOST);       /* For gather functions - don't want to reinitialize */
+      kg_marker         = hypre_CTAlloc(HYPRE_Int, end_row, HYPRE_MEMORY_HOST);       /* For kaporin gradient functions */
 
       /* Initializing local variables */
 
@@ -356,7 +360,7 @@ hypre_FSAISetup( void               *fsai_vdata,
       hypre_SeqVectorInitialize(kaporin_gradient);
       hypre_SeqVectorInitialize(A_sub);
 
-      for( i = 0; i < num_rows; i++ )
+      for( i = 0; i < end_row; i++ )
       {
          marker[i] = -1;
          kg_marker[i] = -1;
@@ -413,9 +417,8 @@ hypre_FSAISetup( void               *fsai_vdata,
                   sol_vec_data[j] = -A_subrow_data[j];
 
                /* Solve A[P, P]G[i, P]' = -A[P, i] */
-               hypre_dpotrf(&uplo, &S_nnz, A_sub_data, &S_nnz, &l);
-
                j = 1;
+               hypre_dpotrf(&uplo, &S_nnz, A_sub_data, &S_nnz, &l);
                hypre_dpotrs(&uplo, &S_nnz, &j, A_sub_data, &S_nnz, sol_vec_data, &S_nnz, &l);
 
                for(j = 0; j < S_nnz; j++)
@@ -433,31 +436,9 @@ hypre_FSAISetup( void               *fsai_vdata,
          for(j = 0; j < S_nnz; j++)
             marker[S_Pattern[j]] = -1;
 
-         #pragma omp barrier
-         #pragma omp critical
-         {
-            hypre_printf("ROW %d START. S_nnz = %d\nS_Pattern: ", i, S_nnz);
-            for(j = 0; j < S_nnz; j++)
-               hypre_printf("%d, ", S_Pattern[j]);
-            hypre_printf("\nG_temp: ");
-            for(j = 0; j < S_nnz; j++)
-               hypre_printf("%f, ", G_temp_data[j]);
-            hypre_printf("\nA_subrow: ");
-            for(j = 0; j < S_nnz; j++)
-               hypre_printf("%f, ", A_subrow_data[j]);
-            hypre_printf("\nA_sub: ");
-            for(j = 0; j < S_nnz*S_nnz; j++){
-               if(j % S_nnz == 0)
-                  hypre_printf("\n");
-               hypre_printf("%f, ", A_sub_data[j]);
-            }
-         
-
-
          row_scale = 1/(sqrt(A_data[A_i[i]] - hypre_abs(hypre_SeqVectorInnerProd(G_temp, A_subrow))));
-         hypre_printf("\nRow Scale: %f, %f, %f\n", A_data[A_i[i]], hypre_abs(hypre_SeqVectorInnerProd(G_temp, A_subrow)), row_scale);
-         hypre_printf("ROW %d DONE. \n\n", i);
          hypre_SeqVectorScale(row_scale, G_temp);
+
          G_data[G_i[i]] = row_scale;
          for(k = 1; k <= S_nnz; k++)
          {
@@ -467,8 +448,14 @@ hypre_FSAISetup( void               *fsai_vdata,
          }
 
          nnz_per_row[i] = S_nnz + 1;        // To condense G later
-         }
+
       }  // END loop through rows
+
+      hypre_VectorSize(G_temp)             = max_row_size;
+      hypre_VectorSize(A_subrow)           = max_row_size;
+      hypre_VectorSize(sol_vec)            = max_row_size;
+      hypre_VectorSize(kaporin_gradient)   = max_row_size;
+      hypre_VectorSize(A_sub)              = max_row_size*max_row_size;
 
       hypre_SeqVectorDestroy(G_temp);
       hypre_SeqVectorDestroy(A_subrow);
@@ -494,7 +481,8 @@ hypre_FSAISetup( void               *fsai_vdata,
             G_data[G_i[i]+j] = G_data[k+j];
             G_data[k+j] = 0.0; 
          }
-   } 
+   }
+ 
    /* Update local number of nonzeros of G */
    hypre_CSRMatrixNumNonzeros(G_diag) = G_i[hypre_ParCSRMatrixGlobalNumRows(G)];
 
